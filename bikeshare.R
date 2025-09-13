@@ -9,7 +9,8 @@ library(DataExplorer)
 
 # read in the data
 bike_train <- vroom("train.csv") %>%
-  select(-casual, -registered)
+  select(-casual, -registered) %>%
+  mutate(count=log(count))
 
 bike_test <- vroom("test.csv")
 
@@ -47,31 +48,50 @@ plot4
 (plot1 + plot2) / (plot3 + plot4)
 
 
+# Cleaning
+my_recipe <- recipe(count~., data = bike_train) %>%
+  step_mutate(weather=ifelse(weather == 4, 3, weather)) |>
+  step_time(datetime, features="hour") |>
+  step_mutate(weather = factor(weather)) |>
+  step_mutate(season=factor(season)) |>
+  step_corr(all_numeric_predictors(), threshold = 0.5)
+prepped_recipe <- prep(my_recipe)
+baked_train <- bake(prepped_recipe, new_data=bike_train)
+
+head(baked_train, 5)
+
 
 # Linear Regression
 
 ## Setup and Fit the Linear Regression Model
 my_linear_model <- linear_reg() %>% #Type of model
   set_engine("lm") %>% # Engine = What R function to use
-  set_mode("regression") %>% # Regression just means quantitative response
-  fit(formula=count~.-datetime, data=bike_train)
+  set_mode("regression") # Regression just means quantitative response
 
-## Generate Predictions Using Linear Model
-bike_predictions <- predict(my_linear_model,
-                            new_data=bike_test) # Use fit to predict
-bike_predictions ## Look at the output
+# Combine into a workflow and fit
+bike_workflow <- workflow() |>
+  add_recipe(my_recipe) |>
+  add_model(my_linear_model) |>
+  fit(data=bike_train)
 
+lin_preds <- predict(bike_workflow, new_data = bike_test)
+lin_preds$count_pred <- exp(lin_preds$.pred)
+
+# ## Generate Predictions Using Linear Model
+# bike_predictions <- predict(my_linear_model,
+#                             new_data=bike_test) # Use fit to predict
+# bike_predictions ## Look at the output
 
 # Format the Predictions for Submission to Kaggle
-kaggle_submission <- bike_predictions %>%
+kaggle_submission <- lin_preds %>%
 bind_cols(., bike_test) %>% #Bind predictions with test data
-  select(datetime, .pred) %>% #Just keep datetime and prediction variables
-  rename(count=.pred) %>% #rename pred to count (for submission to Kaggle)
+  select(datetime, count_pred) %>% #Just keep datetime and prediction variables
+  rename(count = count_pred) %>% #rename pred to count (for submission to Kaggle)
   mutate(count=pmax(0, count)) %>% #pointwise max of (0, prediction)
   mutate(datetime=as.character(format(datetime))) #needed for right format to Kaggle
 
 ## Write out the file
-vroom_write(x=kaggle_submission, file="./LinearPreds.csv", delim=",")
+vroom_write(x=kaggle_submission, file="./LinearPreds2.csv", delim=",")
 
 
 
