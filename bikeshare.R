@@ -55,25 +55,115 @@ plot4
 (plot1 + plot2) / (plot3 + plot4)
 
 
-# Cleaning
+#Cleaning
+# my_recipe <- recipe(count ~ ., data = bike_train) %>%
+#   step_mutate(weather = ifelse(weather == 4, 3, weather)) %>%
+#   step_time(datetime, features = "hour") %>%
+#   step_mutate(weather = factor(weather)) %>%
+#   step_mutate(season = factor(season)) %>%
+#   step_rm(datetime) %>%   # <--- REMOVE datetime
+#   step_corr(all_numeric_predictors(), threshold = 0.5) %>%
+#   step_dummy(all_nominal_predictors()) %>%
+#   step_normalize(all_numeric_predictors())
+# prepped_recipe <- prep(my_recipe)
+# baked_train <- bake(prepped_recipe, new_data=bike_train)
+
+
 my_recipe <- recipe(count ~ ., data = bike_train) %>%
   step_mutate(weather = ifelse(weather == 4, 3, weather)) %>%
   step_time(datetime, features = "hour") %>%
-  step_mutate(weather = factor(weather)) %>%
-  step_mutate(season = factor(season)) %>%
-  step_rm(datetime) %>%   # <--- REMOVE datetime
+  step_date(datetime, features = c("dow", "month", "year")) %>%
+  # Convert them to numeric
+  step_mutate_at(c("datetime_hour", "datetime_dow", "datetime_month"),
+                 fn = as.numeric) %>%
+  
+  # Cyclical encodings
+  step_mutate(
+    hour_sin  = sin(2 * pi * datetime_hour / 24),
+    hour_cos  = cos(2 * pi * datetime_hour / 24),
+    dow_sin   = sin(2 * pi * datetime_dow / 7),
+    dow_cos   = cos(2 * pi * datetime_dow / 7),
+    month_sin = sin(2 * pi * datetime_month / 12),
+    month_cos = cos(2 * pi * datetime_month / 12)
+  ) %>%
+
+  step_mutate(weather = factor(weather),
+              season = factor(season)) %>%
+  step_rm(datetime, datetime_hour, datetime_dow, datetime_month, datetime_year) %>%
   step_corr(all_numeric_predictors(), threshold = 0.5) %>%
-  step_dummy(all_nominal_predictors()) %>% 
+  step_dummy(all_nominal_predictors()) %>%
   step_normalize(all_numeric_predictors())
+
 prepped_recipe <- prep(my_recipe)
 baked_train <- bake(prepped_recipe, new_data=bike_train)
 
-head(baked_train, 5)
+# head(baked_train, 5)
+
+## Penalized regression model
+preg_model <- linear_reg(penalty=tune(),
+                         mixture=tune()) %>% #Set model and tuning
+  set_engine("glmnet") # Function to fit in R
+
+## Set Workflow
+preg_wf <- workflow() %>%
+add_recipe(my_recipe) %>%
+add_model(preg_model)
+
+## Grid of values to tune over
+grid_of_tuning_params <- grid_regular(penalty(),
+                                      mixture(),
+                                      levels = 5) ## L^2 total tuning possibilities16
+
+## Split data for CV1
+folds <- vfold_cv(bike_train, v = 10, repeats=1)
+
+
+## Run the CV
+CV_results <- preg_wf %>%
+tune_grid(resamples=folds,
+          grid=grid_of_tuning_params,
+          metrics=metric_set(rmse, mae)) #Or leave metrics NULL
+
+## Plot Results (example)
+collect_metrics(CV_results) %>% # Gathers metrics into DF
+  filter(.metric=="rmse") %>%
+ggplot(data=., aes(x=penalty, y=mean, color=factor(mixture))) +
+geom_line()
+
+## Find Best Tuning Parameters
+bestTune <- CV_results %>%
+select_best(metric="rmse")
+
+
+## Finalize the Workflow & fit it
+final_wf <-
+preg_wf %>%
+finalize_workflow(bestTune) %>%
+fit(data=bike_train)
+
+## Predict
+final_preds <- predict(final_wf, new_data = bike_test)
+final_preds$count_pred <- exp(final_preds$.pred)
+
+
+# Kaggle submission
+kaggle_submission <- final_preds %>%
+  bind_cols(bike_test) %>%
+  select(datetime, count_pred) %>%
+  rename(count = count_pred) %>%
+  mutate(count = pmax(0, count)) %>%
+  mutate(datetime = as.character(format(datetime)))
+
+## Write out the file
+vroom_write(x=kaggle_submission, file="./LinearPreds12.csv", delim=",")
+
+
+###############################################################################
 
 
 # Penalized Regression Model
 ## Penalized regression model9
-preg_model <- linear_reg(penalty=5, mixture=0.25) %>% #Set model and tuning
+preg_model <- linear_reg(penalty=0.01, mixture=0.2) %>% #Set model and tuning
   set_engine("glmnet") # Function to fit in R11
 
 preg_wf <- workflow() %>%
@@ -92,15 +182,16 @@ kaggle_submission <- lin_preds %>%
   mutate(datetime=as.character(format(datetime))) 
 
 ## Write out the file
-vroom_write(x=kaggle_submission, file="./LinearPreds7.csv", delim=",")
+vroom_write(x=kaggle_submission, file="./LinearPreds8.csv", delim=",")
 
 # 3: p=0.001, v=0.5
 # 4: p=0.01, v=0.2
 # 5: p=0.001, v=0.8
 # 6: p=0.001, v=0.1
 # 7: p=5, v=0.25
+# try p=0, v = 0.01
 
-
+###############################################################################
 
 # Linear Regression
 
