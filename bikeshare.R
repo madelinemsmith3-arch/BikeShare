@@ -1,5 +1,6 @@
 install.packages("DataExplorer")
 install.packages("glmnet")
+install.packages("rpart")
 
 library(tidyverse)
 library(tidymodels)
@@ -53,6 +54,87 @@ plot4
 
 
 (plot1 + plot2) / (plot3 + plot4)
+
+
+
+## Create a workflow with model & recipe
+my_recipe <- recipe(count ~ ., data = bike_train) %>%
+  step_mutate(weather = ifelse(weather == 4, 3, weather)) %>%
+  step_time(datetime, features = "hour") %>%
+  step_date(datetime, features = c("dow", "month", "year")) %>%
+  # Convert them to numeric
+  step_mutate_at(c("datetime_hour", "datetime_dow", "datetime_month"),
+                 fn = as.numeric) %>%
+  
+  # Cyclical encodings
+  step_mutate(
+    hour_sin  = sin(2 * pi * datetime_hour / 24),
+    hour_cos  = cos(2 * pi * datetime_hour / 24),
+    dow_sin   = sin(2 * pi * datetime_dow / 7),
+    dow_cos   = cos(2 * pi * datetime_dow / 7),
+    month_sin = sin(2 * pi * datetime_month / 12),
+    month_cos = cos(2 * pi * datetime_month / 12)
+  ) %>%
+  
+  step_mutate(weather = factor(weather),
+              season = factor(season)) %>%
+  step_rm(datetime, datetime_hour, datetime_dow, datetime_month, datetime_year) %>%
+  step_corr(all_numeric_predictors(), threshold = 0.5) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+prepped_recipe <- prep(my_recipe)
+baked_train <- bake(prepped_recipe, new_data=bike_train)
+
+my_mod <- decision_tree(tree_depth = tune(),
+                        cost_complexity = tune(),
+                        min_n=tune()) %>% #Type of model
+  set_engine("rpart") %>% # What R function to use
+  set_mode("regression")
+
+
+preg_wf <- workflow() %>%
+  add_recipe(my_recipe) %>%
+  add_model(my_mod)
+
+## Set up grid of tuning values
+grid_of_tuning_params <- grid_regular(tree_depth(),
+                                      cost_complexity(),
+                                      min_n(),
+                                      levels = 5) ## L^2 total tuning possibilities16
+## Set up K-fold CV
+folds <- vfold_cv(bike_train, v = 10, repeats=1)
+
+CV_results <- preg_wf %>%
+  tune_grid(resamples=folds,
+            grid=grid_of_tuning_params,
+            metrics=metric_set(rmse, mae)) #Or leave metrics NULL
+
+## Find best tuning parameters
+bestTune <- CV_results %>%
+  select_best(metric="rmse")
+
+## Finalize workflow and predict
+final_wf <-
+  preg_wf %>%
+  finalize_workflow(bestTune) %>%
+  fit(data=bike_train)
+
+## Predict
+final_preds <- predict(final_wf, new_data = bike_test)
+final_preds$count_pred <- exp(final_preds$.pred)
+
+# Kaggle submission
+kaggle_submission <- final_preds %>%
+  bind_cols(bike_test) %>%
+  select(datetime, count_pred) %>%
+  rename(count = count_pred) %>%
+  mutate(count = pmax(0, count)) %>%
+  mutate(datetime = as.character(format(datetime)))
+
+## Write out the file
+vroom_write(x=kaggle_submission, file="./LinearPreds13.csv", delim=",")
+
 
 
 #Cleaning
