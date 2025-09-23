@@ -1,6 +1,7 @@
 install.packages("DataExplorer")
 install.packages("glmnet")
 install.packages("rpart")
+install.packages("ranger")
 
 library(tidyverse)
 library(tidymodels)
@@ -9,6 +10,8 @@ library(patchwork)
 library(DataExplorer)
 library(dplyr)
 library(glmnet)
+library(rpart)
+library(ranger)
 # setwd("C:\\Users\\madel\\OneDrive\\Documents\\Stat 348\\BikeShare")
 
 
@@ -59,38 +62,48 @@ plot4
 
 ## Create a workflow with model & recipe
 my_recipe <- recipe(count ~ ., data = bike_train) %>%
+  # Fix weather 4 -> 3
   step_mutate(weather = ifelse(weather == 4, 3, weather)) %>%
-  step_time(datetime, features = "hour") %>%
-  step_date(datetime, features = c("dow", "month", "year")) %>%
-  # Convert them to numeric
-  step_mutate_at(c("datetime_hour", "datetime_dow", "datetime_month"),
-                 fn = as.numeric) %>%
   
-  # Cyclical encodings
+  # Extract time/date features
+  step_time(datetime, features = "hour") %>%
+  step_date(datetime, features = c("dow", "month", "year"), ordinal = TRUE) %>%
+  
+  # Cyclical encodings (force numeric for safety)
   step_mutate(
+    dow_sin   = sin(2 * pi * as.numeric(datetime_dow) / 7),
+    dow_cos   = cos(2 * pi * as.numeric(datetime_dow) / 7),
+    month_sin = sin(2 * pi * as.numeric(datetime_month) / 12),
+    month_cos = cos(2 * pi * as.numeric(datetime_month) / 12),
     hour_sin  = sin(2 * pi * datetime_hour / 24),
-    hour_cos  = cos(2 * pi * datetime_hour / 24),
-    dow_sin   = sin(2 * pi * datetime_dow / 7),
-    dow_cos   = cos(2 * pi * datetime_dow / 7),
-    month_sin = sin(2 * pi * datetime_month / 12),
-    month_cos = cos(2 * pi * datetime_month / 12)
+    hour_cos  = cos(2 * pi * datetime_hour / 24)
   ) %>%
   
-  step_mutate(weather = factor(weather),
-              season = factor(season)) %>%
-  step_rm(datetime, datetime_hour, datetime_dow, datetime_month, datetime_year) %>%
-  step_corr(all_numeric_predictors(), threshold = 0.5) %>%
-  step_dummy(all_nominal_predictors()) %>%
-  step_normalize(all_numeric_predictors())
+  # Keep season/weather categorical for dummies
+  step_mutate(
+    weather = factor(weather),
+    season  = factor(season)
+  ) %>%
+  
+  # Drop original datetime and year
+  step_rm(datetime, datetime_year) %>%
+  
+  # One-hot encode all categoricals
+  step_dummy(all_nominal_predictors())
+
 
 prepped_recipe <- prep(my_recipe)
 baked_train <- bake(prepped_recipe, new_data=bike_train)
 
-my_mod <- decision_tree(tree_depth = tune(),
-                        cost_complexity = tune(),
-                        min_n=tune()) %>% #Type of model
-  set_engine("rpart") %>% # What R function to use
+head(baked_train)
+
+
+my_mod <- rand_forest(mtry = tune(),
+                      min_n=tune(),
+                      trees=500) %>% #Type of model
+  set_engine("ranger") %>% # What R function to use
   set_mode("regression")
+
 
 
 preg_wf <- workflow() %>%
@@ -98,12 +111,11 @@ preg_wf <- workflow() %>%
   add_model(my_mod)
 
 ## Set up grid of tuning values
-grid_of_tuning_params <- grid_regular(tree_depth(),
-                                      cost_complexity(),
+grid_of_tuning_params <- grid_regular(mtry(range=c(1,35)),
                                       min_n(),
-                                      levels = 5) ## L^2 total tuning possibilities16
+                                      levels = 5) ## L^2 total tuning possibilities
 ## Set up K-fold CV
-folds <- vfold_cv(bike_train, v = 10, repeats=1)
+folds <- vfold_cv(bike_train, v = 5, repeats=1)
 
 CV_results <- preg_wf %>%
   tune_grid(resamples=folds,
@@ -126,14 +138,24 @@ final_preds$count_pred <- exp(final_preds$.pred)
 
 # Kaggle submission
 kaggle_submission <- final_preds %>%
-  bind_cols(bike_test) %>%
+  bind_cols(., bike_test) %>%
   select(datetime, count_pred) %>%
   rename(count = count_pred) %>%
   mutate(count = pmax(0, count)) %>%
   mutate(datetime = as.character(format(datetime)))
 
 ## Write out the file
-vroom_write(x=kaggle_submission, file="./LinearPreds13.csv", delim=",")
+vroom_write(x=kaggle_submission, file="./LinearPreds14.csv", delim=",")
+
+
+
+
+
+my_mod <- decision_tree(tree_depth = tune(),
+                        cost_complexity = tune(),
+                        min_n=tune()) %>% #Type of model
+  set_engine("rpart") %>% # What R function to use
+  set_mode("regression")
 
 
 
