@@ -2,6 +2,10 @@ install.packages("DataExplorer")
 install.packages("glmnet")
 install.packages("rpart")
 install.packages("ranger")
+install.packages("bonsai")
+install.packages("lightgbm")
+install.packages("dbarts")
+install.packages("agua")
 
 library(tidyverse)
 library(tidymodels)
@@ -12,51 +16,90 @@ library(dplyr)
 library(glmnet)
 library(rpart)
 library(ranger)
+library(bonsai)
+library(lightgbm)
+library(agua)
 # setwd("C:\\Users\\madel\\OneDrive\\Documents\\Stat 348\\BikeShare")
 
-
 # read in the data
-bike_train <- vroom("train.csv")
+bike_train1 <- vroom("train.csv")
 
-bike_train <- vroom("train.csv")%>%
+bike_train <- vroom("train.csv") %>%
   select(-casual, -registered) %>%
-  mutate(count = log(count))
+  mutate(count = log1p(count))   # <-- use log1p instead of log
 
 
 bike_test <- vroom("test.csv")
 
+## Initialize an h2o session
+h2o::h2o.init()
+
+## Create a workflow with model & recipe
+my_recipe <- recipe(count ~ ., data = bike_train) %>%
+  # Fix weather 4 -> 3
+  step_mutate(weather = ifelse(weather == 4, 3, weather)) %>%
+  
+  # Extract time/date features
+  step_time(datetime, features = "hour") %>%
+  step_date(datetime, features = c("dow", "month", "year"), ordinal = TRUE) %>%
+  
+  # Cyclical encodings (force numeric for safety)
+  step_mutate(
+    dow_sin   = sin(2 * pi * as.numeric(datetime_dow) / 7),
+    dow_cos   = cos(2 * pi * as.numeric(datetime_dow) / 7),
+    month_sin = sin(2 * pi * as.numeric(datetime_month) / 12),
+    month_cos = cos(2 * pi * as.numeric(datetime_month) / 12),
+    hour_sin  = sin(2 * pi * datetime_hour / 24),
+    hour_cos  = cos(2 * pi * datetime_hour / 24)
+  ) %>%
+  
+  # Keep season/weather categorical for dummies
+  step_mutate(
+    weather = factor(weather),
+    season  = factor(season)
+  ) %>%
+  
+  # Drop original datetime and year
+  step_rm(datetime, datetime_year) %>%
+  
+  # One-hot encode all categoricals
+  step_dummy(all_nominal_predictors())
 
 
-# EDA
-dplyr::glimpse(bike_train) 
+prepped_recipe <- prep(my_recipe)
+baked_train <- bake(prepped_recipe, new_data = bike_train)
 
-DataExplorer::plot_intro(bike_train)
+## Define the model
+auto_model <- auto_ml() %>%
+  set_engine("h2o", max_runtime_secs=600, max_models=20) %>%
+  set_mode("regression")
 
-DataExplorer::plot_correlation(bike_train)
+## Combine into Workflow
+automl_wf <- workflow() %>%
+  add_recipe(my_recipe) %>%
+  add_model(auto_model) %>%
+  fit(data = bike_train)
 
-DataExplorer::plot_histogram(bike_train)
+## Predict
+final_preds <- predict(automl_wf, new_data = bike_test)
+final_preds$count_pred <- expm1(final_preds$.pred)   # <-- use expm1 instead of exp
 
+# Kaggle submission
+kaggle_submission <- final_preds %>%
+  bind_cols(., bike_test) %>%
+  select(datetime, count_pred) %>%
+  rename(count = count_pred) %>%
+  mutate(count = pmax(0, count)) %>%
+  mutate(datetime = as.character(format(datetime)))
 
-plot1 <- ggplot(data=bike_train, aes(x=registered, y=count)) +
-geom_point() +
-geom_smooth(se=FALSE)
-plot1
-
-plot2 <- ggplot(data=bike_train, aes(x=windspeed, y=count)) +
-  geom_point() +
-  geom_smooth(se=FALSE)
-plot2
-
-plot3 <- ggplot(bike_train, aes(x = weather)) +
-  geom_bar()
-plot3
-
-plot4 <- ggplot(bike_train, aes(x = humidity)) +
-  geom_bar()
-plot4
+## Write out the file
+vroom_write(x = kaggle_submission, file = "./LinearPreds_stack.csv", delim = ",")
 
 
-(plot1 + plot2) / (plot3 + plot4)
+
+## make hour a factor!!!, step time pull out hour and mak eit a variable
+
+
 
 
 
@@ -98,24 +141,22 @@ baked_train <- bake(prepped_recipe, new_data=bike_train)
 head(baked_train)
 
 
-my_mod <- rand_forest(mtry = tune(),
-                      min_n=tune(),
-                      trees=500) %>% #Type of model
-  set_engine("ranger") %>% # What R function to use
+bart_model <- bart(trees=tune()) %>% # BART figures out depth and learn_rate
+  set_engine("dbarts") %>% # might need to install
   set_mode("regression")
 
 
 
 preg_wf <- workflow() %>%
   add_recipe(my_recipe) %>%
-  add_model(my_mod)
+  add_model(bart_model)
 
 ## Set up grid of tuning values
-grid_of_tuning_params <- grid_regular(mtry(range=c(1,35)),
-                                      min_n(),
+grid_of_tuning_params <- grid_regular(trees(),
                                       levels = 5) ## L^2 total tuning possibilities
 ## Set up K-fold CV
 folds <- vfold_cv(bike_train, v = 5, repeats=1)
+
 
 CV_results <- preg_wf %>%
   tune_grid(resamples=folds,
@@ -145,10 +186,18 @@ kaggle_submission <- final_preds %>%
   mutate(datetime = as.character(format(datetime)))
 
 ## Write out the file
-vroom_write(x=kaggle_submission, file="./LinearPreds14.csv", delim=",")
+vroom_write(x=kaggle_submission, file="./LinearPreds_bart.csv", delim=",")
 
 
 
+
+
+
+my_mod <- rand_forest(mtry = tune(),
+                      min_n=tune(),
+                      trees=500) %>% #Type of model
+  set_engine("ranger") %>% # What R function to use
+  set_mode("regression")
 
 
 my_mod <- decision_tree(tree_depth = tune(),
