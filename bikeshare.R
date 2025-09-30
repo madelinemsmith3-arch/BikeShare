@@ -22,8 +22,6 @@ library(agua)
 # setwd("C:\\Users\\madel\\OneDrive\\Documents\\Stat 348\\BikeShare")
 
 # read in the data
-bike_train1 <- vroom("train.csv")
-
 bike_train <- vroom("train.csv") %>%
   select(-casual, -registered) %>%
   mutate(count = log1p(count))   # <-- use log1p instead of log
@@ -34,40 +32,132 @@ bike_test <- vroom("test.csv")
 ## Initialize an h2o session
 h2o::h2o.init()
 
-## Create a workflow with model & recipe
 my_recipe <- recipe(count ~ ., data = bike_train) %>%
-  # Fix weather 4 -> 3
-  step_mutate(weather = ifelse(weather == 4, 3, weather)) %>%
   
-  # Extract time/date features
-  step_time(datetime, features = "hour") %>%
-  step_date(datetime, features = c("dow", "month", "year"), ordinal = TRUE) %>%
-  
-  # Cyclical encodings (force numeric for safety)
+  # --- 1. Extract datetime features ---
   step_mutate(
-    dow_sin   = sin(2 * pi * as.numeric(datetime_dow) / 7),
-    dow_cos   = cos(2 * pi * as.numeric(datetime_dow) / 7),
-    month_sin = sin(2 * pi * as.numeric(datetime_month) / 12),
-    month_cos = cos(2 * pi * as.numeric(datetime_month) / 12),
-    hour_sin  = sin(2 * pi * datetime_hour / 24),
-    hour_cos  = cos(2 * pi * datetime_hour / 24)
+    hour       = hour(datetime),
+    wday       = wday(datetime, week_start = 1),
+    month      = month(datetime),
+    year       = year(datetime),
+    is_weekend = ifelse(wday >= 6, 1, 0)
   ) %>%
   
-  # Keep season/weather categorical for dummies
+  # --- 3. Cyclical encodings for hour, wday, month ---
+  step_mutate(
+    hour_sin   = sin(2 * pi * hour / 24),
+    hour_cos   = cos(2 * pi * hour / 24),
+    wday_sin   = sin(2 * pi * wday / 7),
+    wday_cos   = cos(2 * pi * wday / 7),
+    month_sin  = sin(2 * pi * month / 12),
+    month_cos  = cos(2 * pi * month / 12)
+  ) %>%
+  
+  # --- 7. Convert categorical variables to factors ---
+  step_mutate(weather = ifelse(weather == 4, 3, weather)) %>%
+  step_mutate(weather = factor(weather)) %>%
+  
+  # --- 8. Drop unneeded columns ---
+  step_rm(datetime, hour, wday, month) %>%
+  
+  step_dummy(all_nominal_predictors()) %>%
+  step_zv(all_predictors())
+
+
+prepped_recipe <- prep(my_recipe)
+baked_train <- bake(prepped_recipe, new_data = bike_train)
+
+vroom_write(x = baked_train, file = ".BakedTrain1.csv", delim = ",")
+
+baked_test <- bake(prepped_recipe, new_data = bike_test)
+vroom_write(x = baked_test, file = "./BakedTest.csv", delim = ",")
+
+
+datarobot_preds <- vroom("data_robot_preds.csv")
+
+kaggle_submission <- bike_test %>%
+  select(datetime) %>%
+  bind_cols(datarobot_preds %>% select(count_PREDICTION)) %>%
+  rename(count = count_PREDICTION) %>%
+  mutate(
+    # Backtransform from log1p
+    count = pmax(0, expm1(count)),   # <-- backtransform here and prevent negatives
+    datetime = format(datetime, "%Y-%m-%d %H:%M:%S")  # force exact format
+  )
+
+# Write out with vroom
+vroom_write(kaggle_submission, file = "datarobot.csv", delim = ",")
+
+
+##############################################################################
+## enhanced feature engineering
+my_recipe <- recipe(count ~ ., data = bike_train) %>%
+  
+  # --- 1. Extract datetime features ---
+  step_mutate(
+    hour       = hour(datetime),
+    wday       = wday(datetime, week_start = 1),
+    month      = month(datetime),
+    year       = year(datetime),
+    is_weekend = ifelse(wday >= 6, 1, 0)
+  ) %>%
+  
+  # --- 2. Derived features / interactions ---
+  step_mutate(
+    hour_weekend = hour * is_weekend,             # interaction: hour × weekend
+    is_summer    = ifelse(month %in% c(6,7,8), 1, 0),
+    year_numeric = year - min(year)              # keep year as numeric
+  ) %>%
+  
+  # --- 3. Cyclical encodings for hour, wday, month ---
+  step_mutate(
+    hour_sin   = sin(2 * pi * hour / 24),
+    hour_cos   = cos(2 * pi * hour / 24),
+    wday_sin   = sin(2 * pi * wday / 7),
+    wday_cos   = cos(2 * pi * wday / 7),
+    month_sin  = sin(2 * pi * month / 12),
+    month_cos  = cos(2 * pi * month / 12)
+  ) %>%
+  
+  # --- 4. Linear copies of cyclical features for model ---
+  step_mutate(
+    hour_lin  = hour,
+    wday_lin  = wday,
+    month_lin = month
+  ) %>%
+  
+  # --- 5. Fix weather ---
+  step_mutate(weather = ifelse(weather == 4, 3, weather)) %>%
+  
+  # --- 6. Numeric feature interactions ---
+  step_mutate(
+    temp2      = temp^2,
+    wind_temp  = windspeed * temp,
+    hum_temp   = humidity * temp
+  ) %>%
+  
+  # --- 7. Convert categorical variables to factors ---
   step_mutate(
     weather = factor(weather),
     season  = factor(season)
   ) %>%
   
-  # Drop original datetime and year
-  step_rm(datetime, datetime_year) %>%
+  # --- 8. Drop unneeded columns ---
+  step_rm(datetime, hour, wday, month, year) %>%
   
-  # One-hot encode all categoricals
-  step_dummy(all_nominal_predictors())
+  # --- 9. Normalize numeric predictors ---
+  step_normalize(all_numeric_predictors()) %>%
+  
+  # --- 10. One-hot encode categorical variables ---
+  step_dummy(all_nominal_predictors()) %>%
+  
+  # --- 11. Remove zero-variance predictors ---
+  step_zv(all_predictors())
 
+##########################################################################
 
-prepped_recipe <- prep(my_recipe)
-baked_train <- bake(prepped_recipe, new_data = bike_train)
+#stacking
+
 
 ## Define the model
 auto_model <- auto_ml() %>%
@@ -84,6 +174,7 @@ automl_wf <- workflow() %>%
 final_preds <- predict(automl_wf, new_data = bike_test)
 final_preds$count_pred <- expm1(final_preds$.pred)   # <-- use expm1 instead of exp
 
+
 # Kaggle submission
 kaggle_submission <- final_preds %>%
   bind_cols(., bike_test) %>%
@@ -93,7 +184,7 @@ kaggle_submission <- final_preds %>%
   mutate(datetime = as.character(format(datetime)))
 
 ## Write out the file
-vroom_write(x = kaggle_submission, file = "./LinearPreds_stack.csv", delim = ",")
+vroom_write(x = kaggle_submission, file = "./LinearPreds_new.csv", delim = ",")
 
 
 
